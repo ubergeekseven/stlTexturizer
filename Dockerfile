@@ -1,8 +1,6 @@
 FROM nginx:alpine
 
 COPY . /usr/share/nginx/html
-
-# Remove server version disclosure
-RUN sed -i 's/^.*server_tokens.*$/    server_tokens off;/' /etc/nginx/nginx.conf
+COPY nginx.conf /etc/nginx/conf.d/default.conf
 
 EXPOSE 80
