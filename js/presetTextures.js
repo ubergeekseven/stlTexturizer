@@ -107,6 +107,37 @@ export function loadAllThumbnails() {
 
 export { IMAGE_PRESETS };
 
+// ── Server map library API ────────────────────────────────────────────────────
+
+export async function fetchServerMaps() {
+  try {
+    const r = await fetch('/api/maps');
+    return r.ok ? r.json() : [];
+  } catch { return []; }
+}
+
+export async function uploadMapToServer(file) {
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('name', file.name);
+    const r = await fetch('/api/maps', { method: 'POST', body: fd });
+    return r.ok ? r.json() : null;
+  } catch { return null; }
+}
+
+export async function deleteServerMap(id) {
+  try { await fetch(`/api/maps/${id}`, { method: 'DELETE' }); } catch { /* ignore */ }
+}
+
+export async function loadServerMapAsTexture(id, name) {
+  const r = await fetch(`/api/maps/${id}/file`);
+  if (!r.ok) throw new Error('Failed to fetch map file');
+  const blob = await r.blob();
+  const file = new File([blob], name, { type: blob.type || 'image/png' });
+  return loadCustomTexture(file);
+}
+
 
 /**
  * Build a THREE.CanvasTexture + ImageData from a user-uploaded image File.

@@ -7,7 +7,9 @@ import { initViewer, loadGeometry, setMeshMaterial, setMeshGeometry, setWirefram
          setRotationGizmo, isGizmoDragging } from './viewer.js';
 import { loadModelFile, computeBounds, getTriangleCount }  from './stlLoader.js';
 import { computeSmartResolution } from './smartResolution.js';
-import { loadAllThumbnails, loadFullPreset, loadCustomTexture, IMAGE_PRESETS }  from './presetTextures.js';
+import { loadAllThumbnails, loadFullPreset, loadCustomTexture, IMAGE_PRESETS,
+         fetchServerMaps, uploadMapToServer, deleteServerMap, loadServerMapAsTexture,
+       } from './presetTextures.js';
 import { createPreviewMaterial, updateMaterial } from './previewMaterial.js';
 import { subdivide }          from './subdivision.js';
 import { regularizeMesh }     from './regularize.js';
@@ -28,6 +30,8 @@ let currentBounds     = null;   // bounds of the original geometry
 let currentStlName    = 'model'; // base filename of the loaded STL (no extension)
 let activeMapEntry    = null;   // { name, texture, imageData, width, height, isCustom? }
 let _lastCustomMap    = null;   // most recent uploaded/imported custom-map entry, kept across preset switches so the thumbnail can re-activate it
+let activeMapServerId   = null; // id of the currently active server-stored map, null if preset/none
+let activeModelServerId = null; // id of the currently active server-stored model, null if none
 let previewMaterial   = null;
 let isExporting       = false;
 let isBaking          = false;
@@ -1276,8 +1280,17 @@ function wireEvents() {
       document.querySelectorAll('.preset-swatch').forEach(s => s.classList.remove('active'));
       _showCustomMapThumb(activeMapEntry);
       customMapSwatch.classList.add('active');
+      activeMapServerId = null;
       resetTextureSmoothing();
       updatePreview();
+      // Save to server library then refresh the grid
+      uploadMapToServer(file).then(entry => {
+        if (entry) {
+          activeMapServerId = entry.id;
+          _autoSaveSession();
+          refreshMyMaps();
+        }
+      });
     } catch (err) {
       console.error('Failed to load texture:', err);
     }
@@ -2970,6 +2983,9 @@ async function handleModelFile(file) {
     export3mfBtn.disabled = (activeMapEntry === null);
     updateSmartResBtnState();
     updatePreview();
+    // Save to server model library (non-blocking)
+    activeModelServerId = null;
+    _saveModelToServer(file);
   } catch (err) {
     console.error('Failed to load model:', err);
     alert(t('alerts.loadFailed', { msg: err.message }));
@@ -2979,6 +2995,21 @@ async function handleModelFile(file) {
     // history is meaningless for the new geometry.
     _clearUndoStacks();
   }
+}
+
+async function _saveModelToServer(file) {
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('name', file.name);
+    const r = await fetch('/api/models', { method: 'POST', body: fd });
+    if (r.ok) {
+      const entry = await r.json();
+      activeModelServerId = entry.id;
+      _autoSaveSession();
+      refreshMyModels();
+    }
+  } catch { /* server unavailable — ignore */ }
 }
 
 // ── Live preview ──────────────────────────────────────────────────────────────
@@ -5147,6 +5178,266 @@ if (_settingsPanel) {
 }
 // The lock-scale button doesn't emit input/change — catch it separately.
 lockScaleBtn.addEventListener('click', _autoSaveSettings);
+
+// ── Server session auto-save ─────────────────────────────────────────────────
+
+let _sessionSaveTimer = null;
+
+function _autoSaveSession() {
+  clearTimeout(_sessionSaveTimer);
+  _sessionSaveTimer = setTimeout(async () => {
+    if (!currentGeometry) return;
+    try {
+      const payload = {
+        version: PROJECT_VERSION,
+        ...getSettingsSnapshot(),
+        activeModelServerId,
+        activeMapServerId,
+        mask: _collectCurrentMask(),
+        timestamp: new Date().toISOString(),
+      };
+      await fetch('/api/session', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+    } catch { /* server unavailable — ignore */ }
+  }, 3000);
+}
+
+// Piggyback on the existing settings-panel auto-save so session saves alongside.
+if (_settingsPanel) {
+  _settingsPanel.addEventListener('input', _autoSaveSession);
+  _settingsPanel.addEventListener('change', _autoSaveSession);
+}
+lockScaleBtn.addEventListener('click', _autoSaveSession);
+
+// ── Server session restore on page load ──────────────────────────────────────
+
+(async () => {
+  try {
+    const r = await fetch('/api/session');
+    if (!r.ok || r.status === 204) return;
+    const data = await r.json();
+    if (!data || !data.activeModelServerId) return;
+
+    // Only offer restore if the session is less than 30 days old
+    if (data.timestamp) {
+      const age = Date.now() - new Date(data.timestamp).getTime();
+      if (age > 30 * 24 * 60 * 60 * 1000) return;
+    }
+
+    const banner = document.getElementById('session-restore-banner');
+    if (!banner) return;
+    if (data.timestamp) {
+      const d = new Date(data.timestamp);
+      banner.querySelector('.restore-msg').textContent =
+        `Restore session from ${d.toLocaleDateString()} ${d.toLocaleTimeString()}?`;
+    }
+    banner.style.display = 'flex';
+
+    document.getElementById('session-restore-yes').addEventListener('click', async () => {
+      banner.style.display = 'none';
+      try {
+        // Load model from library
+        if (data.activeModelServerId) {
+          const mr = await fetch(`/api/models/${data.activeModelServerId}/file`);
+          if (mr.ok) {
+            const blob = await mr.blob();
+            const modelManifest = await fetch('/api/models').then(x => x.json()).catch(() => []);
+            const modelEntry = modelManifest.find(m => m.id === data.activeModelServerId);
+            const name = modelEntry ? modelEntry.name : 'model.stl';
+            const file = new File([blob], name, { type: blob.type || 'application/octet-stream' });
+            _autoSavePaused = true;
+            await handleModelFile(file);
+            activeModelServerId = data.activeModelServerId;
+          }
+        }
+        // Restore settings (after model load so refineLength override sticks)
+        applySettingsSnapshot(data);
+        _autoSavePaused = false;
+        // Load map from library
+        if (data.activeMapServerId) {
+          const mapsManifest = await fetch('/api/maps').then(x => x.json()).catch(() => []);
+          const mapEntry = mapsManifest.find(m => m.id === data.activeMapServerId);
+          if (mapEntry) {
+            try {
+              activeMapEntry = await loadServerMapAsTexture(data.activeMapServerId, mapEntry.name);
+              activeMapEntry.isCustom = true;
+              _lastCustomMap = activeMapEntry;
+              activeMapName.textContent = mapEntry.name;
+              document.querySelectorAll('.preset-swatch').forEach(s => s.classList.remove('active'));
+              _showCustomMapThumb(activeMapEntry);
+              customMapSwatch.classList.add('active');
+              activeMapServerId = data.activeMapServerId;
+              updatePreview();
+            } catch { /* map file missing — ignore */ }
+          }
+        }
+        // Restore mask
+        if (data.mask) _restoreMask(data.mask);
+        _autoSaveSession();
+      } catch (err) {
+        console.error('Session restore failed:', err);
+        _autoSavePaused = false;
+      }
+    }, { once: true });
+
+    document.getElementById('session-restore-no').addEventListener('click', async () => {
+      banner.style.display = 'none';
+      try { await fetch('/api/session', { method: 'DELETE' }); } catch { /* ignore */ }
+    }, { once: true });
+  } catch { /* server unavailable — skip */ }
+})();
+
+// ── My Maps library ──────────────────────────────────────────────────────────
+
+const _myMapsGrid = document.getElementById('my-maps-grid');
+
+async function refreshMyMaps() {
+  if (!_myMapsGrid) return;
+  const maps = await fetchServerMaps();
+  _myMapsGrid.innerHTML = '';
+  if (maps.length === 0) {
+    _myMapsGrid.innerHTML = '<div class="my-maps-empty">No saved maps yet</div>';
+    return;
+  }
+  for (const entry of maps) {
+    const wrap = document.createElement('div');
+    wrap.className = 'lib-swatch-wrap';
+
+    const swatch = document.createElement('div');
+    swatch.className = 'preset-swatch' + (activeMapServerId === entry.id ? ' active' : '');
+    swatch.title = entry.name;
+    swatch.setAttribute('role', 'button');
+    swatch.setAttribute('tabindex', '0');
+
+    // Load thumbnail from the map file itself
+    const img = document.createElement('img');
+    img.src = `/api/maps/${entry.id}/file`;
+    img.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;';
+    img.alt = entry.name;
+    swatch.appendChild(img);
+
+    const label = document.createElement('span');
+    label.className = 'preset-label';
+    label.textContent = entry.name;
+    swatch.appendChild(label);
+
+    swatch.addEventListener('click', () => _loadServerMap(entry));
+    swatch.addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); _loadServerMap(entry); }
+    });
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'lib-delete-btn';
+    delBtn.title = 'Remove from library';
+    delBtn.textContent = '×';
+    delBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await deleteServerMap(entry.id);
+      if (activeMapServerId === entry.id) activeMapServerId = null;
+      refreshMyMaps();
+    });
+
+    wrap.appendChild(swatch);
+    wrap.appendChild(delBtn);
+    _myMapsGrid.appendChild(wrap);
+  }
+}
+
+async function _loadServerMap(entry) {
+  try {
+    activeMapEntry = await loadServerMapAsTexture(entry.id, entry.name);
+    activeMapEntry.isCustom = true;
+    _lastCustomMap = activeMapEntry;
+    activeMapName.textContent = entry.name;
+    document.querySelectorAll('.preset-swatch').forEach(s => s.classList.remove('active'));
+    _showCustomMapThumb(activeMapEntry);
+    customMapSwatch.classList.add('active');
+    activeMapServerId = entry.id;
+    resetTextureSmoothing();
+    updatePreview();
+    _autoSaveSession();
+    // Update active highlight in the grid
+    _myMapsGrid.querySelectorAll('.preset-swatch').forEach(s => {
+      s.classList.toggle('active', s.title === entry.name);
+    });
+  } catch (err) {
+    console.error('Failed to load server map:', err);
+  }
+}
+
+refreshMyMaps();
+
+// ── My Models library ────────────────────────────────────────────────────────
+
+const _myModelsList = document.getElementById('my-models-list');
+
+async function refreshMyModels() {
+  if (!_myModelsList) return;
+  let models;
+  try {
+    const r = await fetch('/api/models');
+    models = r.ok ? await r.json() : [];
+  } catch { models = []; }
+  _myModelsList.innerHTML = '';
+  if (models.length === 0) {
+    _myModelsList.innerHTML = '<div class="my-models-empty">No saved models yet</div>';
+    return;
+  }
+  for (const entry of [...models].reverse()) {
+    const item = document.createElement('div');
+    item.className = 'model-list-item';
+
+    const nameEl = document.createElement('span');
+    nameEl.className = 'model-name';
+    nameEl.textContent = entry.name;
+    nameEl.title = entry.name;
+
+    const dateEl = document.createElement('span');
+    dateEl.className = 'model-date';
+    dateEl.textContent = new Date(entry.uploadedAt).toLocaleDateString();
+
+    const loadBtn = document.createElement('button');
+    loadBtn.className = 'model-load-btn';
+    loadBtn.textContent = 'Load';
+    loadBtn.addEventListener('click', async () => {
+      try {
+        const r = await fetch(`/api/models/${entry.id}/file`);
+        if (!r.ok) throw new Error('Failed to fetch model');
+        const blob = await r.blob();
+        const file = new File([blob], entry.name, { type: blob.type || 'application/octet-stream' });
+        await handleModelFile(file);
+        activeModelServerId = entry.id;
+        _autoSaveSession();
+      } catch (err) {
+        console.error('Failed to load model from library:', err);
+        alert('Failed to load model: ' + err.message);
+      }
+    });
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'model-del-btn';
+    delBtn.title = 'Remove from library';
+    delBtn.textContent = '×';
+    delBtn.addEventListener('click', async () => {
+      try {
+        await fetch(`/api/models/${entry.id}`, { method: 'DELETE' });
+        if (activeModelServerId === entry.id) activeModelServerId = null;
+        refreshMyModels();
+      } catch { /* ignore */ }
+    });
+
+    item.appendChild(nameEl);
+    item.appendChild(dateEl);
+    item.appendChild(loadBtn);
+    item.appendChild(delBtn);
+    _myModelsList.appendChild(item);
+  }
+}
+
+refreshMyModels();
 
 // ── Reset to defaults ───────────────────────────────────────────────────────
 // Frozen snapshot of the initial `settings` object plus the default preset
