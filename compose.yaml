@@ -8,4 +8,4 @@ services:
     ports:
       - "8083:3000"
     volumes:
-      - ./data:/data
+      - /mnt/raid1/stltexturizer/data:/data

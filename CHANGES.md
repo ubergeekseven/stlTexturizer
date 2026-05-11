@@ -27,10 +27,10 @@ BumpMesh / stlTexturizer is a browser-based tool that lets you apply displacemen
 
 **Before:** nginx:alpine → serves static files only, no persistence
 
-**After:** node:22-alpine → Express.js serves static files AND provides REST API. All uploaded files stored in `/data/` which is a Docker volume mounted to `./data` on the host.
+**After:** node:22-alpine → Express.js serves static files AND provides REST API. All uploaded files stored in `/data/` which is a Docker volume mounted to `/mnt/raid1/stltexturizer/data` on the host.
 
 ```
-Host ./data/
+Host /mnt/raid1/stltexturizer/data/
 ├── maps/            ← uploaded displacement map image files
 ├── models/          ← uploaded STL/OBJ/3MF model files
 ├── maps.json        ← manifest: [{id, name, filename, size, uploadedAt}]
@@ -176,7 +176,7 @@ docker exec stltexturizer ls /app/js/
 docker logs stltexturizer
 ```
 
-The `./data/` directory is created automatically by the server on first start. It persists as a bind mount — deleting the container does not delete your library or session.
+The `/mnt/raid1/stltexturizer/data/` directory is created automatically by the server on first start. It persists as a bind mount — deleting the container does not delete your library or session.
 
 ---
 
