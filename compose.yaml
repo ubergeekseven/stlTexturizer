@@ -1,7 +1,7 @@
 services:
   stltexturizer:
     build:
-      context: .
+      context: ./app
       dockerfile: Dockerfile
     container_name: stltexturizer
     restart: unless-stopped
